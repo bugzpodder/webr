@@ -6,13 +6,13 @@
 import { ChannelMain } from './chan/channel';
 import { newChannelMain, ChannelType } from './chan/channel-common';
 import { Message } from './chan/message';
-import { BASE_URL, PKG_BASE_URL } from './config';
+import { BASE_URL, PKG_BASE_URL, WEBR_VERSION } from './config';
 import { EmPtr } from './emscripten';
 import { WebRPayloadPtr } from './payload';
 import { newRProxy, newRClassProxy } from './proxy';
 import { isRObject, RCharacter, RComplex, RDouble } from './robj-main';
-import { REnvironment, RSymbol, RInteger } from './robj-main';
-import { RList, RLogical, RNull, RObject, RPairlist, RRaw, RString, RCall } from './robj-main';
+import { REnvironment, RSymbol, RInteger, RList, RDataFrame } from './robj-main';
+import { RLogical, RNull, RObject, RPairlist, RRaw, RString, RCall } from './robj-main';
 import { replaceInObject } from './utils';
 import * as RWorker from './robj-worker';
 import { WebRError, WebRPayloadError } from './error';
@@ -25,8 +25,10 @@ import {
   EvalROptions,
   FSMessage,
   FSMountMessage,
+  FSSyncfsMessage,
   FSReadFileMessage,
   FSWriteFileMessage,
+  InstallPackagesOptions,
   InvokeWasmFunctionMessage,
   NewShelterMessage,
   ShelterDestroyMessage,
@@ -36,6 +38,7 @@ import {
 export { Console, ConsoleCallbacks } from './console';
 export * from './robj-main';
 export * from './error';
+export * from './webr-chan';
 export { ChannelType } from './chan/channel-common';
 
 /**
@@ -88,22 +91,38 @@ export type FSNode = {
   name: string;
   mode: number;
   isFolder: boolean;
-  contents: { [key: string]: FSNode };
+  contents?: { [key: string]: FSNode };
+  mounted: null | {
+    mountpoint: string;
+    root: FSNode;
+  }
 };
 
 /** An Emscripten Filesystem type */
-export type FSType = 'NODEFS' | 'WORKERFS';
+export type FSType = 'NODEFS' | 'WORKERFS' | 'IDBFS';
 
 /**
  * Configuration settings to be used when mounting Filesystem objects with
  * Emscripten
- * */
+ */
 export type FSMountOptions<T extends FSType = FSType> =
   T extends 'NODEFS' ? { root: string } : {
-    blobs?: Array<{name: string, data: Blob}>;
+    blobs?: Array<{ name: string, data: Blob | ArrayBufferLike }>;
     files?: Array<File | FileList>;
-    packages?: Array<{ metadata: any, blob: Blob }>;
+    packages?: Array<{ metadata: FSMetaData, blob: Blob | ArrayBufferLike }>;
   };
+
+/**
+ * Emscripten filesystem image metadata
+ */
+export type FSMetaData = {
+  files: {
+    filename: string;
+    start: number;
+    end: number;
+  }[],
+  gzip?: boolean;
+};
 
 /**
  * The configuration settings to be used when starting webR.
@@ -169,6 +188,8 @@ const defaultEnv = {
   FONTCONFIG_PATH: '/etc/fonts',
   R_HOME: '/usr/lib/R',
   R_ENABLE_JIT: '0',
+  WEBR: '1',
+  WEBR_VERSION: WEBR_VERSION,
 };
 
 const defaultOptions = {
@@ -194,6 +215,7 @@ export class WebR {
   #chan: ChannelMain;
   #initialised: Promise<unknown>;
   globalShelter!: Shelter;
+  version: string = WEBR_VERSION;
 
   RObject!: ReturnType<typeof newRClassProxy<typeof RWorker.RObject, RObject>>;
   RLogical!: ReturnType<typeof newRClassProxy<typeof RWorker.RLogical, RLogical>>;
@@ -203,6 +225,7 @@ export class WebR {
   RComplex!: ReturnType<typeof newRClassProxy<typeof RWorker.RComplex, RComplex>>;
   RRaw!: ReturnType<typeof newRClassProxy<typeof RWorker.RRaw, RRaw>>;
   RList!: ReturnType<typeof newRClassProxy<typeof RWorker.RList, RList>>;
+  RDataFrame!: ReturnType<typeof newRClassProxy<typeof RWorker.RDataFrame, RDataFrame>>;
   RPairlist!: ReturnType<typeof newRClassProxy<typeof RWorker.RPairlist, RPairlist>>;
   REnvironment!: ReturnType<typeof newRClassProxy<typeof RWorker.REnvironment, REnvironment>>;
   RSymbol!: ReturnType<typeof newRClassProxy<typeof RWorker.RSymbol, RSymbol>>;
@@ -245,6 +268,7 @@ export class WebR {
       this.RCharacter = this.globalShelter.RCharacter;
       this.RRaw = this.globalShelter.RRaw;
       this.RList = this.globalShelter.RList;
+      this.RDataFrame = this.globalShelter.RDataFrame;
       this.RPairlist = this.globalShelter.RPairlist;
       this.REnvironment = this.globalShelter.REnvironment;
       this.RSymbol = this.globalShelter.RSymbol;
@@ -260,20 +284,20 @@ export class WebR {
         na: (await this.RObject.getPersistentObject('na')) as RLogical,
       };
 
-      this.#handleSystemMessages();
+      void this.#handleSystemMessages();
     });
   }
 
   /**
    * @returns {Promise<void>} A promise that resolves once webR has been
-   * intialised.
+   * initialised.
    */
   async init() {
     return this.#initialised;
   }
 
   async #handleSystemMessages() {
-    for (;;) {
+    for (; ;) {
       const msg = await this.#chan.readSystem();
       switch (msg.type) {
         case 'setTimeoutWasm':
@@ -283,7 +307,7 @@ export class WebR {
           */
           setTimeout(
             (ptr: EmPtr, args: number[]) => {
-              this.invokeWasmFunction(ptr, ...args);
+              void this.invokeWasmFunction(ptr, ...args);
             },
             msg.data.delay as number,
             msg.data.ptr,
@@ -298,6 +322,9 @@ export class WebR {
           break;
         case 'console.error':
           console.error(msg.data);
+          break;
+        case 'close':
+          this.#chan.close();
           break;
         default:
           throw new WebRError('Unknown system message type `' + msg.type + '`');
@@ -353,15 +380,20 @@ export class WebR {
   }
 
   /**
-   * Install a list of R packages from the default webR CRAN-like repo.
-   * @param {string[]} packages An array of R pacakge names.
-   * @param {boolean} quiet If true, do not output downloading messages.
+   * Install a list of R packages from Wasm binary package repositories.
+   * @param {string | string[]} packages An string or array of strings
+   *   containing R package names.
+   * @param {InstallPackagesOptions} [options] Options to be used when
+   *   installing webR packages.
    */
-  async installPackages(packages: string[], quiet = false) {
-    for (const name of packages) {
-      const msg = { type: 'installPackage', data: { name, quiet } };
-      await this.#chan.request(msg);
-    }
+  async installPackages(packages: string | string[], options?: InstallPackagesOptions) {
+    const op = Object.assign({
+      quiet: false,
+      mount: true
+    }, options);
+
+    const msg = { type: 'installPackages', data: { name: packages, options: op } };
+    await this.#chan.request(msg);
   }
 
   /**
@@ -375,7 +407,7 @@ export class WebR {
   /**
    * Evaluate the given R code.
    *
-   * Stream outputs and any conditions raised during exectution are written to
+   * Stream outputs and any conditions raised during execution are written to
    * the JavaScript console.
    * @param {string} code The R code to evaluate.
    * @param {EvalROptions} [options] Options for the execution environment.
@@ -456,7 +488,38 @@ export class WebR {
       options: FSMountOptions<T>,
       mountpoint: string
     ): Promise<void> => {
+      // Convert blobs to ArrayBuffer for transfer over the communication channel
+      // FIXME: Use a replacer + reviver to transfer `Blob`s
+      let promises: Promise<void>[] = [];
+      if ('blobs' in options && options.blobs) {
+        promises = [...promises, ...options.blobs.map((item) => {
+          if (item.data instanceof Blob) {
+            return item.data.arrayBuffer().then((data) => {
+              item.data = new Uint8Array(data);
+            });
+          } else {
+            return Promise.resolve();
+          }
+        })];
+      }
+      if ('packages' in options && options.packages) {
+        promises = [...promises, ...options.packages.map((pkg) => {
+          if (pkg.blob instanceof Blob) {
+            return pkg.blob.arrayBuffer().then((data) => {
+              pkg.blob = new Uint8Array(data);
+            });
+          } else {
+            return Promise.resolve();
+          }
+        })];
+      }
+      await Promise.all(promises);
+
       const msg: FSMountMessage = { type: 'mount', data: { type, options, mountpoint } };
+      await this.#chan.request(msg);
+    },
+    syncfs: async (populate: boolean): Promise<void> => {
+      const msg: FSSyncfsMessage = { type: 'syncfs', data: { populate } };
       await this.#chan.request(msg);
     },
     readFile: async (path: string, flags?: string): Promise<Uint8Array> => {
@@ -497,6 +560,7 @@ export class Shelter {
   RComplex!: ReturnType<typeof newRClassProxy<typeof RWorker.RComplex, RComplex>>;
   RRaw!: ReturnType<typeof newRClassProxy<typeof RWorker.RRaw, RRaw>>;
   RList!: ReturnType<typeof newRClassProxy<typeof RWorker.RList, RList>>;
+  RDataFrame!: ReturnType<typeof newRClassProxy<typeof RWorker.RDataFrame, RDataFrame>>;
   RPairlist!: ReturnType<typeof newRClassProxy<typeof RWorker.RPairlist, RPairlist>>;
   REnvironment!: ReturnType<typeof newRClassProxy<typeof RWorker.REnvironment, REnvironment>>;
   RSymbol!: ReturnType<typeof newRClassProxy<typeof RWorker.RSymbol, RSymbol>>;
@@ -526,6 +590,7 @@ export class Shelter {
     this.RCharacter = newRClassProxy<typeof RWorker.RCharacter, RCharacter>(this.#chan, this.#id, 'character');
     this.RRaw = newRClassProxy<typeof RWorker.RRaw, RRaw>(this.#chan, this.#id, 'raw');
     this.RList = newRClassProxy<typeof RWorker.RList, RList>(this.#chan, this.#id, 'list');
+    this.RDataFrame = newRClassProxy<typeof RWorker.RDataFrame, RDataFrame>(this.#chan, this.#id, 'dataframe');
     this.RPairlist = newRClassProxy<typeof RWorker.RPairlist, RPairlist>(this.#chan, this.#id, 'pairlist');
     this.REnvironment = newRClassProxy<typeof RWorker.REnvironment, REnvironment>(this.#chan, this.#id, 'environment');
     this.RSymbol = newRClassProxy<typeof RWorker.RSymbol, RSymbol>(this.#chan, this.#id, 'symbol');
@@ -563,7 +628,7 @@ export class Shelter {
   /**
    * Evaluate the given R code.
    *
-   * Stream outputs and any conditions raised during exectution are written to
+   * Stream outputs and any conditions raised during execution are written to
    * the JavaScript console. The returned R object is protected by the shelter.
    * @param {string} code The R code to evaluate.
    * @param {EvalROptions} [options] Options for the execution environment.
@@ -588,17 +653,22 @@ export class Shelter {
   /**
    * Evaluate the given R code, capturing output.
    *
-   * Stream outputs and conditions raised during exectution are captured and
+   * Stream outputs and conditions raised during execution are captured and
    * returned as part of the output of this function. Returned R objects are
    * protected by the shelter.
    * @param {string} code The R code to evaluate.
    * @param {EvalROptions} [options] Options for the execution environment.
-   * @returns {Promise<{result: RObject, output: unknown[]}>} An object
-   * containing the result of the computation and and array of captured output.
+   * @returns {Promise<{
+   *   result: RObject,
+   *   output: { type: string; data: any }[],
+   *   images: ImageBitmap[]
+   * }>} An object containing the result of the computation, an array of output,
+   *   and an array of captured plots.
    */
   async captureR(code: string, options: EvalROptions = {}): Promise<{
     result: RObject;
-    output: unknown[];
+    output: { type: string; data: any }[];
+    images: ImageBitmap[];
   }> {
     const opts = replaceInObject(options, isRObject, (obj: RObject) => obj._payload);
     const msg: CaptureRMessage = {
@@ -619,9 +689,11 @@ export class Shelter {
         const data = payload.obj as {
           result: WebRPayloadPtr;
           output: { type: string; data: any }[];
+          images: ImageBitmap[];
         };
         const result = newRProxy(this.#chan, data.result);
         const output = data.output;
+        const images = data.images;
 
         for (let i = 0; i < output.length; ++i) {
           if (output[i].type !== 'stdout' && output[i].type !== 'stderr') {
@@ -629,7 +701,7 @@ export class Shelter {
           }
         }
 
-        return { result, output };
+        return { result, output, images };
       }
     }
   }
@@ -643,6 +715,6 @@ function newShelterProxy(chan: ChannelMain) {
       return out;
     },
   }) as unknown as {
-    new (): Promise<Shelter>;
+    new(): Promise<Shelter>;
   };
 }

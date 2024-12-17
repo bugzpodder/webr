@@ -2,7 +2,6 @@ project:
   type: website
   output-dir: _site
   resources:
-    - /webr-serviceworker.js
     - /webr-worker.js
 
 website:
@@ -15,7 +14,7 @@ website:
   favicon: images/webR.png
   page-navigation: true
   sidebar:
-    title: "WebR 0.2.2-dev Documentation"
+    title: "WebR {{< env WEBR_VERSION >}} Documentation"
     logo: images/webR.png
     contents:
       - index.qmd
@@ -32,7 +31,11 @@ website:
           - objects.qmd
           - convert-r-to-js.qmd
           - convert-js-to-r.qmd
-      - packages.qmd
+      - section: R Packages and Data
+        contents:
+          - packages.qmd
+          - building.qmd
+          - mounting.qmd
       - section: WebR API
         contents:
           - api/r.qmd
@@ -47,7 +50,9 @@ website:
 
 format:
   html:
-    theme: cosmo
+    theme: 
+      light: cosmo
+      dark: darkly
     link-external-newwindow: true
     link-external-filter: '^(?:http:|https:)\/\/docs\.r-wasm\.org'
     toc: true

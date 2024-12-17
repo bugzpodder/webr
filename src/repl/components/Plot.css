@@ -1,21 +1,16 @@
-.plot {
-  display: grid;
-  grid-template-rows: auto 1fr;
-}
-
 .plot-background {
   background-color: var(--bg-dark);
+  flex-grow: 1;
+  overflow: auto;
   display: flex;
   justify-content: center;
   align-items: center;
-  min-height: 0;
-  min-width: 0;
 }
 
 .plot-container {
   max-width: 90%;
   max-height: 90%;
-  aspect-ratio: 1 / 1;
+  overflow: hidden;
   background-color: white;
 }
 
@@ -32,7 +27,7 @@
   background-color: var(--bg-primary);
 }
 
-.plot-actions > button {
+.plot-actions>button {
   background-color: transparent;
   border: none;
   color: var(--secondary);
@@ -40,9 +35,10 @@
   font-size: 14px;
 }
 
-.plot-actions > button:hover {
+.plot-actions>button:hover {
   color: var(--primary);
 }
-.plot-actions > button:disabled {
+
+.plot-actions>button:disabled {
   color: var(--disabled);
 }

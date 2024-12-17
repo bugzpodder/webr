@@ -4,12 +4,13 @@
  */
 import { Module } from './emscripten';
 import { Complex, isComplex, NamedEntries, NamedObject, WebRDataRaw, WebRDataScalar } from './robj';
-import { WebRData, WebRDataAtomic, RPtr, RType, RTypeMap, RTypeNumber } from './robj';
+import { WebRData, WebRDataAtomic, RPtr, RType, RTypeMap, RTypeNumber, RCtor } from './robj';
 import { isWebRDataJs, WebRDataJs, WebRDataJsAtomic, WebRDataJsNode } from './robj';
 import { WebRDataJsNull, WebRDataJsString, WebRDataJsSymbol } from './robj';
+import { isSimpleObject } from './utils';
 import { envPoke, parseEvalBare, protect, protectInc, unprotect } from './utils-r';
 import { protectWithIndex, reprotect, unprotectIndex, safeEval } from './utils-r';
-import { ShelterID, isShelterID } from './webr-chan';
+import { EvalROptions, ShelterID, isShelterID } from './webr-chan';
 
 export type RHandle = RObject | RPtr;
 
@@ -92,7 +93,12 @@ export type Nullable<T> = T | RNull;
 function newObjectFromData(obj: WebRData): RObject {
   // Conversion of WebRDataJs type JS objects
   if (isWebRDataJs(obj)) {
-    return new (getRWorkerClass(RTypeMap[obj.type]))(obj);
+    return new (getRWorkerClass(obj.type))(obj);
+  }
+
+  // Map JS's 'undefined' type to R's NULL object
+  if (typeof obj == 'undefined') {
+    return new RNull();
   }
 
   // Conversion of explicit R NULL value
@@ -116,18 +122,54 @@ function newObjectFromData(obj: WebRData): RObject {
   if (isComplex(obj)) {
     return new RComplex(obj);
   }
+
+  // Conversion of composite JS objects
+  if (ArrayBuffer.isView(obj) || obj instanceof ArrayBuffer) {
+    return new RRaw(obj);
+  }
   if (Array.isArray(obj)) {
     return newObjectFromArray(obj);
   }
+  // Any other JS object shape is reserved for creating an R `data.frame`
+  if (typeof obj === 'object') {
+    return RDataFrame.fromObject(obj);
+  }
 
-  throw new Error('Robj construction for this JS object is not yet supported');
+  throw new Error('R object construction for this JS object is not yet supported.');
 }
 
-// JS arrays are interpreted using R's c() function, so as to match
-// R's built in coercion rules
-function newObjectFromArray(arr: WebRData[]) {
+function newObjectFromArray(arr: WebRData[]): RObject {
   const prot = { n: 0 };
 
+  // Is this a D3 formatted data frame?
+  const hasObjects = arr.every((v) => v && typeof v === 'object' && !isRObject(v) && !isComplex(v));
+  if (hasObjects) {
+    const _arr = arr as { [key: string]: WebRData }[];
+    const isConsistent = _arr.every((a) => {
+      return Object.keys(a).filter((k) => !Object.keys(_arr[0]).includes(k)).length === 0 &&
+        Object.keys(_arr[0]).filter((k) => !Object.keys(a).includes(k)).length === 0;
+    });
+    const isAtomic = _arr.every((a) => Object.values(a).every((v) => {
+      return isAtomicType(v) || isRVectorAtomic(v);
+    }));
+    if (isConsistent && isAtomic) {
+      return RDataFrame.fromD3(_arr);
+    }
+  }
+
+  // Not D3 formatted - Can we shortcut and convert directly?
+  if (arr.every((v) => typeof v === 'boolean' || v === null)) {
+    return new RLogical(arr as (boolean | null)[]);
+  }
+  if (arr.every((v) => typeof v === 'number' || v === null)) {
+    return new RDouble(arr as (number | null)[]);
+  }
+  if (arr.every((v) => typeof v === 'string' || v === null)) {
+    return new RCharacter(arr as (string | null)[]);
+  }
+
+  // Not D3 & mixed types: use R's built in object coercion with c() so as to
+  // match R's built in coercion rules
   try {
     const call = new RCall([new RSymbol('c'), ...arr]);
     protectInc(call, prot);
@@ -162,8 +204,9 @@ export class RObject extends RObjectBase {
   }
 
   static wrap<T extends typeof RObject>(this: T, ptr: RPtr): InstanceType<T> {
-    const type = Module._TYPEOF(ptr);
-    return new (getRWorkerClass(type as RTypeNumber))(new RObjectBase(ptr)) as InstanceType<T>;
+    const typeNumber = Module._TYPEOF(ptr) as RTypeNumber;
+    const type = Object.keys(RTypeMap)[Object.values(RTypeMap).indexOf(typeNumber)];
+    return new (getRWorkerClass(type as RType))(new RObjectBase(ptr)) as InstanceType<T>;
   }
 
   get [Symbol.toStringTag](): string {
@@ -188,12 +231,33 @@ export class RObject extends RObjectBase {
     return Module._TYPEOF(this.ptr) === RTypeMap.null;
   }
 
+  isNa(): boolean {
+    try {
+      const result = parseEvalBare('is.na(x)', { x: this }) as RLogical;
+      protect(result);
+      return result.toBoolean();
+    } finally {
+      unprotect(1);
+    }
+  }
+
   isUnbound(): boolean {
     return this.ptr === objs.unboundValue.ptr;
   }
 
   attrs(): Nullable<RPairlist> {
     return RPairlist.wrap(Module._ATTRIB(this.ptr));
+  }
+
+  class(): RCharacter {
+    const prot = { n: 0 };
+    const classCall = new RCall([new RSymbol('class'), this]);
+    protectInc(classCall, prot);
+    try {
+      return classCall.eval() as RCharacter;
+    } finally {
+      unprotect(prot.n);
+    }
   }
 
   setNames(values: (string | null)[] | null): this {
@@ -226,6 +290,7 @@ export class RObject extends RObjectBase {
     return names && names.includes(name);
   }
 
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   toJs(options: ToJsOptions = { depth: 0 }, depth = 1): WebRDataJs {
     throw new Error('This R object cannot be converted to JS');
   }
@@ -413,10 +478,10 @@ export class RPairlist extends RObject {
   toObject({
     allowDuplicateKey = true,
     allowEmptyKey = false,
-    depth = 1,
+    depth = -1,
   } = {}): NamedObject<WebRData> {
     const entries = this.entries({ depth });
-    const keys = entries.map(([k, v]) => k);
+    const keys = entries.map(([k,]) => k);
     if (!allowDuplicateKey && new Set(keys).size !== keys.length) {
       throw new Error('Duplicate key when converting pairlist without allowDuplicateKey enabled');
     }
@@ -425,7 +490,7 @@ export class RPairlist extends RObject {
     }
     return Object.fromEntries(
       entries.filter((u, idx) => entries.findIndex((v) => v[0] === u[0]) === idx)
-    );
+    ) as NamedObject<WebRData>;
   }
 
   entries(options: ToJsOptions = { depth: 1 }): NamedEntries<WebRData> {
@@ -518,30 +583,71 @@ export class RCall extends RObject {
   }
 
   eval(): RObject {
-    return RObject.wrap(safeEval(this.ptr, objs.baseEnv));
+    return Module.webr.evalR(this, { env: objs.baseEnv });
+  }
+
+  capture(options: EvalROptions = {}) {
+    return Module.webr.captureR(this, options);
+  }
+
+  deparse(): string {
+    const prot = { n: 0 };
+    try {
+      const call = Module._Rf_lang2(
+        new RSymbol('deparse1').ptr,
+        Module._Rf_lang2(new RSymbol('quote').ptr, this.ptr)
+      );
+      protectInc(call, prot);
+
+      const val = RCharacter.wrap(safeEval(call, objs.baseEnv));
+      protectInc(val, prot);
+
+      return val.toString();
+    } finally {
+      unprotect(prot.n);
+    }
   }
 }
 
 export class RList extends RObject {
-  constructor(val: WebRData) {
+  constructor(val: WebRData, names: (string | null)[] | null = null) {
     if (val instanceof RObjectBase) {
       assertRType(val, 'list');
       super(val);
+      if (names) {
+        if (names.length !== this.length) {
+          throw new Error(
+            "Can't construct named `RList`. Supplied `names` must be the same length as the list."
+          );
+        }
+        this.setNames(names);
+      }
       return this;
     }
 
     const prot = { n: 0 };
 
     try {
-      const { names, values } = toWebRData(val);
-      const ptr = Module._Rf_allocVector(RTypeMap.list, values.length);
+      const data = toWebRData(val);
+      const ptr = Module._Rf_allocVector(RTypeMap.list, data.values.length);
       protectInc(ptr, prot);
 
-      values.forEach((v, i) => {
-        Module._SET_VECTOR_ELT(ptr, i, new RObject(v).ptr);
+      data.values.forEach((v, i) => {
+        // When we specifically use the `RList` constructor, deeply convert R objects to R lists
+        if (isSimpleObject(v)) {
+          Module._SET_VECTOR_ELT(ptr, i, new RList(v).ptr);
+        } else {
+          Module._SET_VECTOR_ELT(ptr, i, new RObject(v).ptr);
+        }
       });
 
-      RObject.wrap(ptr).setNames(names);
+      const _names = names ? names : data.names;
+      if (_names && _names.length !== data.values.length) {
+        throw new Error(
+          "Can't construct named `RList`. Supplied `names` must be the same length as the list."
+        );
+      }
+      RObject.wrap(ptr).setNames(_names);
 
       super(new RObjectBase(ptr));
     } finally {
@@ -553,6 +659,11 @@ export class RList extends RObject {
     return Module._LENGTH(this.ptr);
   }
 
+  isDataFrame(): boolean {
+    const classes = RPairlist.wrap(Module._ATTRIB(this.ptr)).get('class') as RNull | RCharacter;
+    return !classes.isNull() && classes.toArray().includes('data.frame');
+  }
+
   toArray(options: { depth: number } = { depth: 1 }): WebRData[] {
     return this.toJs(options).values;
   }
@@ -560,10 +671,10 @@ export class RList extends RObject {
   toObject({
     allowDuplicateKey = true,
     allowEmptyKey = false,
-    depth = 1,
+    depth = -1,
   } = {}): NamedObject<WebRData> {
     const entries = this.entries({ depth });
-    const keys = entries.map(([k, v]) => k);
+    const keys = entries.map(([k,]) => k);
     if (!allowDuplicateKey && new Set(keys).size !== keys.length) {
       throw new Error('Duplicate key when converting list without allowDuplicateKey enabled');
     }
@@ -572,11 +683,30 @@ export class RList extends RObject {
     }
     return Object.fromEntries(
       entries.filter((u, idx) => entries.findIndex((v) => v[0] === u[0]) === idx)
-    );
+    ) as NamedObject<WebRData>;
   }
 
-  entries(options: { depth: number } = { depth: 1 }): NamedEntries<WebRData> {
+  toD3(): NamedObject<WebRData>[] {
+    if (!this.isDataFrame()) {
+      throw new Error(
+        "Can't convert R list object to D3 format. Object must be of class 'data.frame'."
+      );
+    }
+    const entries = this.entries() as Array<[string, atomicType[]]>;
+    return entries.reduce((a, entry) => {
+      entry[1].forEach((v, j) => a[j] = Object.assign(a[j] || {}, { [entry[0]!]: v }));
+      return a;
+    }, []);
+  }
+
+  entries(options: { depth: number } = { depth: -1 }): NamedEntries<WebRData> {
     const obj = this.toJs(options);
+
+    // If this is a data frame, assume we have atomic vector columns and can
+    // convert directly to array values by default.
+    if (this.isDataFrame() && options.depth < 0) {
+      obj.values = (obj.values as RVectorAtomic<atomicType>[]).map((v) => v.toArray());
+    }
     return obj.values.map((v, i) => [obj.names ? obj.names[i] : null, v]);
   }
 
@@ -595,6 +725,65 @@ export class RList extends RObject {
   }
 }
 
+export class RDataFrame extends RList {
+  constructor(val: WebRData) {
+    if (val instanceof RObjectBase) {
+      super(val);
+      if (!this.isDataFrame()) {
+        throw new Error("Can't construct `RDataFrame`. Supplied R object is not a `data.frame`.");
+      }
+      return this;
+    }
+    return RDataFrame.fromObject(val);
+  }
+
+  static fromObject(obj: WebRData) {
+    const { names, values } = toWebRData(obj);
+    const prot = { n: 0 };
+
+    // Do we have consistent columns of atomic type? If so, make a `data.frame`.
+    try {
+      const hasNames = !!names && names.length > 0 && names.every((v) => v);
+      const hasArrays = values.length > 0 && values.every((v) => {
+        return Array.isArray(v) || ArrayBuffer.isView(v) || v instanceof ArrayBuffer;
+      });
+
+      if (hasNames && hasArrays) {
+        const _values = values as WebRData[][];
+        const isConsistentLength = _values.every((a) => a.length === _values[0].length);
+        const isAtomic = _values.every((a) => {
+          return isAtomicType(a[0]) || isRVectorAtomic(a[0]);
+        });
+
+        if (isConsistentLength && isAtomic) {
+          const listObj = new RList({
+            type: 'list',
+            names: names,
+            values: _values.map((a) => newObjectFromData(a))
+          });
+          protectInc(listObj, prot);
+
+          const asDataFrame = new RCall([new RSymbol('as.data.frame'), listObj]);
+          protectInc(asDataFrame, prot);
+
+          return new RDataFrame(asDataFrame.eval());
+        }
+      }
+    } finally {
+      unprotect(prot.n);
+    }
+
+    // Not eligible as a `data.frame`, throw an error.
+    throw new Error("Can't construct `data.frame`. Source object is not eligible.");
+  }
+
+  static fromD3(arr: { [key: string]: WebRData }[]) {
+    return this.fromObject(
+      Object.fromEntries(Object.keys(arr[0]).map((k) => [k, arr.map((v) => v[k])]))
+    );
+  }
+}
+
 export class RFunction extends RObject {
   exec(...args: (WebRDataRaw | RObject)[]): RObject {
     const prot = { n: 0 };
@@ -603,6 +792,18 @@ export class RFunction extends RObject {
       const call = new RCall([this, ...args]);
       protectInc(call, prot);
       return call.eval();
+    } finally {
+      unprotect(prot.n);
+    }
+  }
+
+  capture(options: EvalROptions = {}, ...args: (WebRDataRaw | RObject)[]) {
+    const prot = { n: 0 };
+
+    try {
+      const call = new RCall([this, ...args]);
+      protectInc(call, prot);
+      return call.capture(options);
     } finally {
       unprotect(prot.n);
     }
@@ -706,11 +907,12 @@ export class REnvironment extends RObject {
     return this.getDollar(prop);
   }
 
-  toObject({ depth = 0 } = {}): NamedObject<WebRData> {
+  toObject({ depth = -1 } = {}): NamedObject<WebRData> {
     const symbols = this.names();
     return Object.fromEntries(
       [...Array(symbols.length).keys()].map((i) => {
-        return [symbols[i], this.getDollar(symbols[i]).toJs({ depth })];
+        const value = this.getDollar(symbols[i]);
+        return [symbols[i], depth < 0 ? value : value.toJs({ depth })];
       })
     );
   }
@@ -786,7 +988,7 @@ abstract class RVectorAtomic<T extends atomicType> extends RObject {
     return super.subset(prop) as this;
   }
 
-  getDollar(prop: string): RObject {
+  getDollar(): RObject {
     throw new Error('$ operator is invalid for atomic vectors');
   }
 
@@ -816,7 +1018,7 @@ abstract class RVectorAtomic<T extends atomicType> extends RObject {
 
   toObject({ allowDuplicateKey = true, allowEmptyKey = false } = {}): NamedObject<T | null> {
     const entries = this.entries();
-    const keys = entries.map(([k, v]) => k);
+    const keys = entries.map(([k,]) => k);
     if (!allowDuplicateKey && new Set(keys).size !== keys.length) {
       throw new Error(
         'Duplicate key when converting atomic vector without allowDuplicateKey enabled'
@@ -829,7 +1031,7 @@ abstract class RVectorAtomic<T extends atomicType> extends RObject {
     }
     return Object.fromEntries(
       entries.filter((u, idx) => entries.findIndex((v) => v[0] === u[0]) === idx)
-    );
+    ) as NamedObject<T | null>;
   }
 
   entries(): NamedEntries<T | null> {
@@ -1060,6 +1262,9 @@ export class RCharacter extends RVectorAtomic<string> {
 
 export class RRaw extends RVectorAtomic<number> {
   constructor(val: WebRDataAtomic<number>) {
+    if (val instanceof ArrayBuffer) {
+      val = new Uint8Array(val);
+    }
     super(val, 'raw', RRaw.#newSetter);
   }
 
@@ -1116,25 +1321,27 @@ function toWebRData(jsObj: WebRData): WebRData {
   return { names: null, values: [jsObj] };
 }
 
-export function getRWorkerClass(type: RTypeNumber): typeof RObject {
-  const typeClasses: { [key: number]: typeof RObject } = {
-    [RTypeMap.null]: RNull,
-    [RTypeMap.symbol]: RSymbol,
-    [RTypeMap.pairlist]: RPairlist,
-    [RTypeMap.closure]: RFunction,
-    [RTypeMap.environment]: REnvironment,
-    [RTypeMap.call]: RCall,
-    [RTypeMap.special]: RFunction,
-    [RTypeMap.builtin]: RFunction,
-    [RTypeMap.string]: RString,
-    [RTypeMap.logical]: RLogical,
-    [RTypeMap.integer]: RInteger,
-    [RTypeMap.double]: RDouble,
-    [RTypeMap.complex]: RComplex,
-    [RTypeMap.character]: RCharacter,
-    [RTypeMap.list]: RList,
-    [RTypeMap.raw]: RRaw,
-    [RTypeMap.function]: RFunction,
+export function getRWorkerClass(type: RType | RCtor): typeof RObject {
+  const typeClasses: { [key: string]: typeof RObject } = {
+    object: RObject,
+    null: RNull,
+    symbol: RSymbol,
+    pairlist: RPairlist,
+    closure: RFunction,
+    environment: REnvironment,
+    call: RCall,
+    special: RFunction,
+    builtin: RFunction,
+    string: RString,
+    logical: RLogical,
+    integer: RInteger,
+    double: RDouble,
+    complex: RComplex,
+    character: RCharacter,
+    list: RList,
+    raw: RRaw,
+    function: RFunction,
+    dataframe: RDataFrame,
   };
   if (type in typeClasses) {
     return typeClasses[type];
@@ -1154,6 +1361,39 @@ export function getRWorkerClass(type: RTypeNumber): typeof RObject {
  */
 export function isRObject(value: any): value is RObject {
   return value instanceof RObject;
+}
+
+/**
+ * Test for an RWorker.RVectorAtomic instance.
+ *
+ * @private
+ * @param {any} value The object to test.
+ * @return {boolean} True if the object is an instance of an RVectorAtomic.
+ */
+export function isRVectorAtomic(value: any): value is RVectorAtomic<atomicType> {
+  const atomicRTypes = ['logical', 'integer', 'double', 'complex', 'character'];
+
+  return (
+    (isRObject(value) && atomicRTypes.includes(value.type()))
+    || (isRObject(value) && value.isNa())
+  );
+}
+
+/**
+ * Test for an atomicType, including missing `null` values.
+ *
+ * @private
+ * @param {any} value The object to test.
+ * @return {boolean} True if the object is of type atomicType.
+ */
+export function isAtomicType(value: any): value is atomicType | null {
+  return (
+    value === null
+    || typeof value === 'number'
+    || typeof value === 'boolean'
+    || typeof value === 'string'
+    || isComplex(value)
+  );
 }
 
 /**
@@ -1179,7 +1419,7 @@ export let objs: {
  * Populate the persistent R object store.
  * @internal
  */
-export function initPersistentObjects(){
+export function initPersistentObjects() {
   objs = {
     baseEnv: REnvironment.wrap(Module.getValue(Module._R_BaseEnv, '*')),
     bracket2Symbol: RSymbol.wrap(Module.getValue(Module._R_Bracket2Symbol, '*')),

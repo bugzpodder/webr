@@ -19,7 +19,7 @@ function build(input: string, output: string, platform: esbuild.Platform, minify
   return esbuild.context({
     assetNames: 'assets/[name]-[hash]',
     bundle: true,
-    entryPoints: [ input ],
+    entryPoints: [input],
     external: ['worker_threads', 'path', 'fs'],
     loader: {
       '.jpg': 'file',
@@ -45,15 +45,15 @@ function build(input: string, output: string, platform: esbuild.Platform, minify
 
 const outputs = {
   browser: [
-    build('repl/App.tsx', '../dist/repl.mjs', 'neutral', prod),
+    build('repl/App.tsx', '../dist/repl.mjs', 'browser', prod),
     build('webR/chan/serviceworker.ts', '../dist/webr-serviceworker.js', 'browser', false),
-    build('webR/webr-worker.ts', '../dist/webr-worker.js', 'node', false),
+    build('webR/webr-worker.ts', '../dist/webr-worker.js', 'node', true),
     build('webR/webr-main.ts', '../dist/webr.mjs', 'neutral', prod),
   ],
   npm: [
     build('webR/chan/serviceworker.ts', './dist/webr-serviceworker.mjs', 'neutral', false),
     build('webR/chan/serviceworker.ts', './dist/webr-serviceworker.js', 'browser', false),
-    build('webR/webr-worker.ts', './dist/webr-worker.js', 'node', false),
+    build('webR/webr-worker.ts', './dist/webr-worker.js', 'node', true),
     build('webR/webr-main.ts', './dist/webr.cjs', 'node', prod),
     build('webR/webr-main.ts', './dist/webr.mjs', 'neutral', prod),
   ]
@@ -62,24 +62,20 @@ const allOutputs = outputs.browser.concat(pkg ? outputs.npm : []);
 
 allOutputs.forEach((build) => {
   build
-    .then((context) => {
-      context.rebuild();
-      return context;
-    })
-    .then((context) => {
-      if (serve) context.watch();
+    .then(async (context) => {
+      await context.rebuild();
+      if (serve) await context.watch();
     })
     .catch((reason) => {
       console.error(reason);
-      throw new Error('A problem occured building webR distribution with esbuild');
+      throw new Error('A problem occurred building webR distribution with esbuild');
     });
-  }
-);
+});
 
 if (serve) {
   outputs.browser[0]
-    .then((context) => {
-      context.serve({ servedir: '../dist', port: 8001 }).then(() => {
+    .then(async (context) => {
+      await context.serve({ servedir: '../dist', port: 8001 }).then(() => {
         http
           .createServer((req, res) => {
             const { url, method, headers } = req;
@@ -90,7 +86,7 @@ if (serve) {
                   res.writeHead(proxyRes.statusCode!, {
                     ...proxyRes.headers,
                     'cross-origin-opener-policy': 'same-origin',
-                    'cross-origin-embedder-policy': 'require-corp',
+                    'cross-origin-embedder-policy': 'credentialless',
                     'cross-origin-resource-policy': 'cross-origin',
                   });
                   proxyRes.pipe(res, { end: true });
@@ -105,12 +101,17 @@ if (serve) {
     })
     .catch((reason) => {
       console.error(reason);
-      throw new Error('A problem occured service webR distribution with esbuild');
+      throw new Error('A problem occurred serving webR distribution with esbuild');
     });
 } else {
   allOutputs.forEach(build => {
-    build.then((context) => {
-      context.dispose();
-    });
+    build
+      .then(async (context) => {
+        await context.dispose();
+      })
+      .catch((reason) => {
+        console.error(reason);
+        throw new Error('A problem occurred running esbuild');
+      });
   });
 }

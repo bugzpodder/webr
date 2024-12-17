@@ -37,7 +37,10 @@ export const RTypeMap = {
   function: 99,
 } as const;
 export type RType = keyof typeof RTypeMap;
-export type RTypeNumber = (typeof RTypeMap)[keyof typeof RTypeMap];
+export type RTypeNumber = typeof RTypeMap[RType];
+
+/** @internal */
+export type RCtor = 'object' | 'dataframe';
 
 export type Complex = {
   re: number;
@@ -55,6 +58,7 @@ export type WebRDataRaw =
   | Error
   | ArrayBuffer
   | ArrayBufferView
+  | ImageBitmap
   | Array<WebRDataRaw>
   | Map<WebRDataRaw, WebRDataRaw>
   | Set<WebRDataRaw>
@@ -77,6 +81,8 @@ export type WebRData =
   | WebRDataRaw
   | WebRDataJs
   | WebRData[]
+  | ArrayBuffer
+  | ArrayBufferView
   | { [key: string]: WebRData };
 
 /**
@@ -86,13 +92,13 @@ export type WebRData =
  */
 export type WebRDataAtomic<T> =
   | WebRDataScalar<T>
-  | (T | null)[]
   | WebRDataJsAtomic<T>
-  | NamedObject<T | null>;
+  | NamedObject<T | null>
+  | ([T] extends [number] ? ArrayBuffer | ArrayBufferView | (number | null)[] : (T | null)[]);
 
 /**
  * `WebRDataJs` objects form a tree structure, used when serialising R objects
- * into a JavaScript respresentation.
+ * into a JavaScript representation.
  *
  * Nested R objects are serialised using the {@link WebRDataJsNode} type,
  * forming branches in the resulting tree structure, with leaves formed by the
@@ -139,7 +145,8 @@ export type WebRDataJsAtomic<T> = {
  * @returns {boolean} True if the object is an instance of a {@link WebRDataJs}.
  */
 export function isWebRDataJs(value: any): value is WebRDataJs {
-  return value && typeof value === 'object' && Object.keys(RTypeMap).includes(value.type as string);
+  return !!value && typeof value === 'object'
+    && Object.keys(RTypeMap).includes(value.type as string);
 }
 
 /**
@@ -153,5 +160,5 @@ export type WebRDataScalar<T> = T | RMain.RObject | RWorker.RObjectBase;
  * @returns {boolean} True if the object is of type {@link Complex}.
  */
 export function isComplex(value: any): value is Complex {
-  return value && typeof value === 'object' && 're' in value && 'im' in value;
+  return !!value && typeof value === 'object' && 're' in value && 'im' in value;
 }

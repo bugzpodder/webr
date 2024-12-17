@@ -6,7 +6,7 @@
 import { ChannelMain } from './chan/channel';
 import { replaceInObject } from './utils';
 import { isWebRPayloadPtr, WebRPayloadPtr, WebRPayload } from './payload';
-import { RType, WebRData, WebRDataRaw } from './robj';
+import { RType, RCtor, WebRData, WebRDataRaw } from './robj';
 import { isRObject, RObject, isRFunction } from './robj-main';
 import * as RWorker from './robj-worker';
 import { ShelterID, CallRObjectMethodMessage, NewRObjectMessage } from './webr-chan';
@@ -43,15 +43,19 @@ export type DistProxy<U> = U extends RWorker.RObject ? RProxy<U> : U;
  * converted to a corresponding type using `RProxify` recursively.
  * @typeParam T The type to convert.
  */
-export type RProxify<T> = T extends Array<any>
+export type RProxify<T> = T extends Array<any> // [RObject, RObject, ...]
   ? Promise<DistProxy<T[0]>[]>
-  : T extends (...args: infer U) => any
+  : T extends (...args: infer U) => any // (...args) => <RObject>
   ? (
-      ...args: {
-        [V in keyof U]: DistProxy<U[V]>;
-      }
-    ) => RProxify<ReturnType<T>>
-  : Promise<DistProxy<T>>;
+    ...args: {
+      [V in keyof U]: DistProxy<U[V]>;
+    }
+  ) => RProxify<ReturnType<T>>
+  : T extends { result: RWorker.RObject, output: RWorker.RObject } // Return type of .capture()
+  ? Promise<{
+    [U in keyof T]: DistProxy<T[U]>
+  }>
+  : Promise<DistProxy<T>>; // RObject, any other types
 
 /**
  * Create an {@link RProxy} based on an {@link RWorker.RObject} type parameter.
@@ -60,12 +64,12 @@ export type RProxify<T> = T extends Array<any>
  * {@link RWorker.RObject} on the main thread. An {@link RProxy} object has the
  * same instance methods as the given {@link RWorker.RObject} parameter, with
  * the following differences:
- * * Method arguments take `RProxy` in place of {@link RWorker.RObject}.
+ * - Method arguments take `RProxy` in place of {@link RWorker.RObject}.
  *
- * * Where an {@link RWorker.RObject} would be returned, an `RProxy` is
+ * - Where an {@link RWorker.RObject} would be returned, an `RProxy` is
  *   returned instead.
  *
- * * All return types are wrapped in a Promise.
+ * - All return types are wrapped in a Promise.
  *
  * If required, the {@link Payload.WebRPayloadPtr} object associated with the
  * proxy can be accessed directly through the `_payload` property.
@@ -85,22 +89,22 @@ export type RProxy<T extends RWorker.RObject> = { [P in Methods<T>]: RProxify<T[
  * @typeParam T The type of the {@link RWorker.RObject} class to be proxied.
  * @typeParam R The type to be returned from the proxied class constructor.
  */
-export type ProxyConstructor<T,R> = (T extends abstract new (...args: infer U) => any
-    ? {
-        new (
-          ...args: {
-            [V in keyof U]: U[V];
-          }
-        ): Promise<R>;
+export type ProxyConstructor<T, R> = (T extends abstract new (...args: infer U) => any
+  ? {
+    new(
+      ...args: {
+        [V in keyof U]: U[V];
       }
-    : never) & {
+    ): Promise<R>;
+  }
+  : never) & {
     [P in Methods<typeof RWorker.RObject>]: RProxify<(typeof RWorker.RObject)[P]>;
   };
 
 /* The empty function is used as base when we are proxying RFunction objects.
  * This enables function call semantics on the proxy using the apply hook.
  */
-function empty() {}
+function empty() { return; }
 
 /* Proxy the asyncIterator property for R objects with a length. This allows us
  * to use the `for await (i of obj){}` JavaScript syntax.
@@ -139,9 +143,9 @@ function targetAsyncIterator(chan: ChannelMain, proxy: RProxy<RWorker.RObject>) 
  * {@link RWorker.RObject} static method is called.
  * @internal
  */
-export function targetMethod(chan: ChannelMain, prop: string): any;
-export function targetMethod(chan: ChannelMain, prop: string, payload: WebRPayloadPtr): any;
-export function targetMethod(chan: ChannelMain, prop: string, payload?: WebRPayloadPtr): any {
+export function targetMethod(chan: ChannelMain, prop: string): unknown;
+export function targetMethod(chan: ChannelMain, prop: string, payload: WebRPayloadPtr): unknown;
+export function targetMethod(chan: ChannelMain, prop: string, payload?: WebRPayloadPtr): unknown {
   return async (..._args: WebRData[]) => {
     const args = _args.map((arg) => {
       if (isRObject(arg)) {
@@ -180,15 +184,15 @@ export function targetMethod(chan: ChannelMain, prop: string, payload?: WebRPayl
  */
 async function newRObject(
   chan: ChannelMain,
-  objType: RType | 'object',
+  objType: RType | RCtor,
   shelter: ShelterID,
-  value: WebRData
+  ...args: WebRData[]
 ) {
   const msg: NewRObjectMessage = {
     type: 'newRObject',
     data: {
       objType,
-      obj: replaceInObject(value, isRObject, (obj: RObject) => obj._payload),
+      args: replaceInObject<WebRData[]>(args, isRObject, (obj: RObject) => obj._payload),
       shelter: shelter,
     },
   };
@@ -239,8 +243,8 @@ export function newRProxy(chan: ChannelMain, payload: WebRPayloadPtr): RProxy<RW
  * Proxy an {@link RWorker.RObject} class.s
  * @param {ChannelMain} chan The current main thread communication channel.
  * @param {ShelterID} shelter The shelter ID to protect returned objects with.
- * @param {(RType | 'object')} objType The R object type, or `'object'` for the
- * generic {@link RWorker.RObject} class.
+ * @param {(RType | RCtor)} objType The R object type or class, `'object'` for
+ * the generic {@link RWorker.RObject} class.
  * @returns {ProxyConstructor} A proxy to the R object subclass corresponding to
  * the given value of the `objType` argument.
  * @typeParam T The type of the {@link RWorker.RObject} class to be proxied.
@@ -249,12 +253,12 @@ export function newRProxy(chan: ChannelMain, payload: WebRPayloadPtr): RProxy<RW
 export function newRClassProxy<T, R>(
   chan: ChannelMain,
   shelter: ShelterID,
-  objType: RType | 'object'
+  objType: RType | RCtor
 ) {
   return new Proxy(RWorker.RObject, {
-    construct: (_, args: [WebRData]) => newRObject(chan, objType, shelter, ...args),
+    construct: (_, args: WebRData[]) => newRObject(chan, objType, shelter, ...args),
     get: (_, prop: string | number | symbol) => {
       return targetMethod(chan, prop.toString());
     },
-  }) as unknown as ProxyConstructor<T,R>;
+  }) as unknown as ProxyConstructor<T, R>;
 }

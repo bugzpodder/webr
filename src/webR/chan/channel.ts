@@ -7,8 +7,9 @@ import { promiseHandles, ResolveFn, RejectFn } from '../utils';
 import { AsyncQueue } from './queue';
 import { Message, newRequest, Response } from './message';
 import { WebRPayload, WebRPayloadWorker, webRPayloadAsError } from '../payload';
+import { WebRChannelError } from '../error';
 
-// The channel structure is asymetric:
+// The channel structure is asymmetric:
 //
 // - The main thread maintains the input and output queues. All
 //   messages sent from main are stored in the input queue. The input
@@ -34,6 +35,7 @@ export abstract class ChannelMain {
   systemQueue = new AsyncQueue<Message>();
 
   #parked = new Map<string, { resolve: ResolveFn; reject: RejectFn }>();
+  #closed = false;
 
   abstract initialised: Promise<unknown>;
   abstract close(): void;
@@ -56,6 +58,9 @@ export abstract class ChannelMain {
   }
 
   write(msg: Message): void {
+    if (this.#closed) {
+      throw new WebRChannelError("The webR communication channel has been closed.");
+    }
     this.inputQueue.put(msg);
   }
 
@@ -70,6 +75,7 @@ export abstract class ChannelMain {
   }
 
   protected putClosedMessage(): void {
+    this.#closed = true;
     this.outputQueue.put({ type: 'closed' });
   }
 
@@ -106,7 +112,7 @@ export interface ChannelWorker {
 }
 
 /**
- * Handler functions dealing with setup and commmunication over a Service Worker.
+ * Handler functions dealing with setup and communication over a Service Worker.
  */
 export interface ServiceWorkerHandlers {
   handleActivate: (this: ServiceWorkerGlobalScope, ev: ExtendableEvent) => any;

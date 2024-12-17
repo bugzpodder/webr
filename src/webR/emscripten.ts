@@ -1,11 +1,15 @@
 import type { RPtr, RTypeNumber } from './robj';
+import type { RObject, RList } from './robj-worker';
+import type { EvalROptions } from './webr-chan';
 import type { UnwindProtectException } from './utils-r';
+import type { ChannelWorker } from './chan/channel';
 
 export interface Module extends EmscriptenModule {
   /* Add mkdirTree to FS namespace, missing from @types/emscripten at the
    * time of writing.
    */
   FS: typeof FS & {
+    _mount: typeof FS.mount;
     mkdirTree(path: string): void;
     filesystems: {
       [key: string]: Emscripten.FileSystemType;
@@ -13,22 +17,22 @@ export interface Module extends EmscriptenModule {
   };
   ENV: { [key: string]: string };
   GOT: {
-    [key: string]: {required: boolean; value: number};
+    [key: string]: { required: boolean; value: number };
   }
   createLazyFilesystem: () => void;
   monitorRunDependencies: (n: number) => void;
   noImageDecoding: boolean;
   noAudioDecoding: boolean;
   noWasmDecoding: boolean;
-  setPrompt: (prompt: string) => void;
-  canvasExec: (op: string) => void;
   downloadFileContent: (
     URL: string,
-    headers: Array<string>
+    headers?: Array<string>
   ) => {
     status: number;
     response: string | ArrayBuffer;
   };
+  mountImageUrl: (url: string, mountpoint: string) => void;
+  mountImagePath: (path: string, mountpoint: string) => void;
   // Exported Emscripten JS API
   allocateUTF8: typeof allocateUTF8;
   allocateUTF8OnStack: typeof allocateUTF8OnStack;
@@ -36,7 +40,7 @@ export interface Module extends EmscriptenModule {
   setValue: typeof setValue;
   UTF8ToString: typeof UTF8ToString;
   callMain: (args: string[]) => void;
-  getWasmTableEntry: (entry: number) => Function;
+  getWasmTableEntry: (entry: number) => (...args: any[]) => RPtr;
   // R symbols from Rinternals.h
   _ATTRIB: (ptr: RPtr) => RPtr;
   _CAR: (ptr: RPtr) => RPtr;
@@ -123,10 +127,26 @@ export interface Module extends EmscriptenModule {
   // TODO: Namespace all webR properties
   webr: {
     UnwindProtectException: typeof UnwindProtectException;
+    channel: ChannelWorker | undefined,
+    canvas: {
+      [key: number]: {
+        ctx: OffscreenCanvasRenderingContext2D;
+        offscreen: OffscreenCanvas;
+        transmit: boolean;
+      };
+    };
     readConsole: () => number;
+    setPrompt: (prompt: string) => void;
     resolveInit: () => void;
     handleEvents: () => void;
-    evalJs: (code: RPtr) => number;
+    dataViewer: (data: RPtr, title: string) => void;
+    evalJs: (code: RPtr) => unknown;
+    evalR: (expr: string | RObject, options?: EvalROptions) => RObject;
+    captureR: (expr: string | RObject, options: EvalROptions) => {
+      result: RObject,
+      output: RList,
+      images: ImageBitmap[],
+    };
     setTimeoutWasm: (ptr: EmPtr, data: EmPtr, delay: number) => void;
   };
 }

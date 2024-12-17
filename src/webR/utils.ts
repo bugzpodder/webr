@@ -1,14 +1,20 @@
 import { IN_NODE } from './compat';
 import { WebRError } from './error';
+import { isComplex, isWebRDataJs } from './robj';
+import { RObjectBase } from './robj-worker';
 
 export type ResolveFn = (_value?: unknown) => void;
 export type RejectFn = (_reason?: any) => void;
 
 export function promiseHandles() {
   const out = {
-    resolve: (_value?: unknown) => {},
-    reject: (_reason?: any) => {},
-    promise: null as unknown as Promise<unknown>,
+    resolve: () => { return; },
+    reject: () => { return; },
+    promise: Promise.resolve(),
+  } as {
+    resolve: ResolveFn,
+    reject: RejectFn,
+    promise: Promise<unknown>,
   };
 
   const promise = new Promise((resolve, reject) => {
@@ -30,8 +36,11 @@ export function replaceInObject<T>(
   replacer: (obj: any, ...replacerArgs: any[]) => unknown,
   ...replacerArgs: unknown[]
 ): T | T[] {
-  if (obj === null || typeof obj !== 'object') {
+  if (obj === null || obj === undefined || isImageBitmap(obj)) {
     return obj;
+  }
+  if (obj instanceof ArrayBuffer) {
+    return new Uint8Array(obj) as T;
   }
   if (test(obj)) {
     return replacer(obj, ...replacerArgs) as T;
@@ -41,9 +50,15 @@ export function replaceInObject<T>(
       replaceInObject(v, test, replacer, ...replacerArgs)
     ) as T[];
   }
-  return Object.fromEntries(
-    Object.entries(obj).map(([k, v], i) => [k, replaceInObject(v, test, replacer, ...replacerArgs)])
-  ) as T;
+  if (obj instanceof RObjectBase) {
+    return obj;
+  }
+  if (typeof obj === 'object') {
+    return Object.fromEntries(
+      Object.entries(obj).map(([k, v]) => [k, replaceInObject(v, test, replacer, ...replacerArgs)])
+    ) as T;
+  }
+  return obj;
 }
 
 /* Workaround for loading a cross-origin script.
@@ -83,9 +98,40 @@ export function isCrossOrigin(urlString: string) {
   return true;
 }
 
+export function isImageBitmap(value: any): value is ImageBitmap {
+  return (typeof ImageBitmap !== 'undefined' && value instanceof ImageBitmap);
+}
+
 export function throwUnreachable(context?: string) {
   let msg = 'Reached the unreachable';
   msg = msg + (context ? ': ' + context : '.');
 
   throw new WebRError(msg);
+}
+
+export function isSimpleObject(value: any): value is {[key: string | number | symbol]: any} {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    !Array.isArray(value) &&
+    !(ArrayBuffer.isView(value)) &&
+    !isComplex(value) &&
+    !isWebRDataJs(value) &&
+    !(value instanceof Date) &&
+    !(value instanceof RegExp) &&
+    !(value instanceof Error) &&
+    !(value instanceof RObjectBase) &&
+    Object.getPrototypeOf(value) === Object.prototype
+  );
+}
+
+// From https://stackoverflow.com/a/9458996
+export function bufferToBase64(buffer: ArrayBuffer) {
+  let binary = '';
+  const bytes = new Uint8Array(buffer);
+  const len = bytes.byteLength;
+  for (let i = 0; i < len; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return window.btoa(binary);
 }

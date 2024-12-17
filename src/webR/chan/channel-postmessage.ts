@@ -4,7 +4,7 @@ import { Endpoint } from './task-common';
 import { ChannelType } from './channel-common';
 import { WebROptions } from '../webr-main';
 import { ChannelMain } from './channel';
-import { WebRChannelError } from '../error';
+import { WebRChannelError, WebRWorkerError } from '../error';
 
 import { IN_NODE } from '../compat';
 import type { Worker as NodeWorker } from 'worker_threads';
@@ -18,15 +18,21 @@ export class PostMessageChannelMain extends ChannelMain {
 
   initialised: Promise<unknown>;
   resolve: (_?: unknown) => void;
-  close = () => {};
+  reject: (message: string | Error) => void;
+  close: () => void = () => { return; };
   #worker?: Worker;
 
   constructor(config: Required<WebROptions>) {
     super();
+    ({ resolve: this.resolve, reject: this.reject, promise: this.initialised } = promiseHandles());
+
     const initWorker = (worker: Worker) => {
       this.#worker = worker;
       this.#handleEventsFromWorker(worker);
-      this.close = () => worker.terminate();
+      this.close = () => {
+        worker.terminate();
+        this.putClosedMessage();
+      };
       const msg = {
         type: 'init',
         data: { config, channelType: ChannelType.PostMessage },
@@ -42,8 +48,6 @@ export class PostMessageChannelMain extends ChannelMain {
       const worker = new Worker(`${config.baseUrl}webr-worker.js`);
       initWorker(worker);
     }
-
-    ({ resolve: this.resolve, promise: this.initialised } = promiseHandles());
   }
 
   interrupt() {
@@ -53,11 +57,23 @@ export class PostMessageChannelMain extends ChannelMain {
   #handleEventsFromWorker(worker: Worker) {
     if (IN_NODE) {
       (worker as unknown as NodeWorker).on('message', (message: Message) => {
-        this.#onMessageFromWorker(worker, message);
+        void this.#onMessageFromWorker(worker, message);
+      });
+      (worker as unknown as NodeWorker).on('error', (ev: Event) => {
+        console.error(ev);
+        this.reject(new WebRWorkerError(
+          "An error occurred initialising the webR PostMessageChannel worker."
+        ));
       });
     } else {
       worker.onmessage = (ev: MessageEvent) =>
         this.#onMessageFromWorker(worker, ev.data as Message);
+      worker.onerror = (ev) => {
+        console.error(ev);
+        this.reject(new WebRWorkerError(
+          "An error occurred initialising the webR PostMessageChannel worker."
+        ));
+      };
     }
   }
 
@@ -148,7 +164,7 @@ export class PostMessageChannelWorker {
     if (this.#promptDepth > 0) {
       this.#promptDepth = 0;
       const msg = Module.allocateUTF8OnStack(
-       "Can't block for input when using the PostMessage communication channel."
+        "Can't block for input when using the PostMessage communication channel."
       );
       Module._Rf_error(msg);
     }
@@ -177,7 +193,7 @@ export class PostMessageChannelWorker {
     Module._setup_Rmainloop();
     Module._R_ReplDLLinit();
     Module._R_ReplDLLdo1();
-    this.#asyncREPL();
+    void this.#asyncREPL();
   }
 
   setDispatchHandler(dispatch: (msg: Message) => void) {
@@ -194,8 +210,8 @@ export class PostMessageChannelWorker {
     return prom;
   }
 
-  setInterrupt(_: () => void) {}
-  handleInterrupt() {}
+  setInterrupt() { return; }
+  handleInterrupt() { return; }
 
   onMessageFromMainThread(message: Message) {
     const msg = message as Response;
@@ -216,14 +232,14 @@ export class PostMessageChannelWorker {
    * fallback REPL to yield to the event loop with await.
    *
    * The drawback of this approach is that nested REPLs do not work, such as
-   * realine, browser or menu. Attempting to use a nested REPL prints an error
+   * readline, browser or menu. Attempting to use a nested REPL prints an error
    * to the JS console.
    *
    * R/Wasm errors during execution are caught and the REPL is restarted at the
    * top level. Any other JS errors are re-thrown.
    */
   #asyncREPL = async () => {
-    for (;;) {
+    for (; ;) {
       try {
         this.#promptDepth = 0;
         const msg = (await this.request({ type: 'read' })) as Message;
@@ -250,7 +266,16 @@ export class PostMessageChannelWorker {
           this.#dispatch(msg);
         }
       } catch (e) {
-        // Don't break the REPL loop on any other Wasm issues
+        // Close on unrecoverable error
+        if (e instanceof WebAssembly.RuntimeError) {
+          this.writeSystem({ type: 'console.error', data: e.message });
+          this.writeSystem({
+            type: 'console.error',
+            data: "An unrecoverable WebAssembly error has occurred, the webR worker will be closed.",
+          });
+          this.writeSystem({ type: 'close' });
+        }
+        // Don't break the REPL loop on other Wasm `Exception` errors
         if (!(e instanceof (WebAssembly as any).Exception)) {
           throw e;
         }

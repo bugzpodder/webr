@@ -12,34 +12,52 @@ jobs:
   build:
     name: Build webR
     runs-on: ubuntu-latest
-    container: ghcr.io/r-wasm/webr-flang:main
+    container: ghcr.io/r-wasm/flang-wasm:main
     steps:
-      - uses: actions/setup-node@v3
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: 'lts/*'
+          node-version: '20'
           registry-url: 'https://registry.npmjs.org'
-      - uses: actions/checkout@v3
+      - name: Set npm dist-tag to "next" if pre-release version
+        if: contains(github.ref_name, '-dev') || contains(github.ref_name, '-rc')
+        run: echo "DIST_TAG=next" >> $GITHUB_ENV
       - name: Install required system packages
         run: apt-get update && apt-get install -y gh jq sudo
       - uses: r-lib/actions/setup-r@v2
         with:
           use-public-rspm: true
       - uses: quarto-dev/quarto-actions/setup@v2
-      - name: Install required R packages
+      - name: Install required R packages for building documentation
         run: Rscript -e 'install.packages(c("rmarkdown", "rvest"))'
       - name: Configure webR for flang
+        env:
+          EMFC: /opt/flang/host/bin/flang-new
         run: ./configure
-      - name: Copy flang into webR tree
-        run: |
-          cp -r /opt/flang/wasm .
-          cp -r /opt/flang/host .
-          cp /opt/flang/emfc ./host/bin/emfc
       - name: Setup Emscripten PATH
         run: echo "/opt/emsdk:/opt/emsdk/upstream/emscripten" >> $GITHUB_PATH
       - name: Set Emscripten EM_NODE_JS
         run: echo "EM_NODE_JS=$(which node)" >> $GITHUB_ENV
       - name: Set the webR CDN URL as the BASE_URL
         run: echo "BASE_URL=https://webr.r-wasm.org/${{ github.ref_name }}/" > "$HOME/.webr-config.mk"
+        shell: bash
+      - name: Set versioning for main
+        if: "contains(github.ref_name, 'main')"
+        run: |
+          SHA="${{github.event.pull_request.head.sha}}${{ github.sha }}"
+          SHORT_SHA=${SHA:0:7}
+          VER=$(node -p "require('./src/package.json').version")
+          echo "version: ${VER}+${SHORT_SHA}"
+          echo "WEBR_VERSION=${VER}+${SHORT_SHA}" >> "$HOME/.webr-config.mk"
+          echo "WEBR_VERSION_TAG=latest" >> "$HOME/.webr-config.mk"
+        shell: bash
+      - name: Set versioning for tag
+        if: "!contains(github.ref_name, 'main')"
+        run: |
+          VER=$(node -p "require('./src/package.json').version")
+          echo "version: ${VER}"
+          echo "WEBR_VERSION=${VER}" >> "$HOME/.webr-config.mk"
+          echo "WEBR_VERSION_TAG=${{ github.ref_name }}" >> "$HOME/.webr-config.mk"
         shell: bash
       - name: Build all optional wasm libs
         env:
@@ -53,8 +71,15 @@ jobs:
       - name: Build webR documentation
         run: cd src/docs && make
         shell: bash
+      - name: Publish to npm
+        if: "!contains(github.ref_name, 'main')"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: cd src && make publish
+      - name: Workaround for codecov/feedback#263
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Report code coverage
-        uses: codecov/codecov-action@v3
+        uses: codecov/codecov-action@v4
         with:
           files: src/coverage/lcov.info
           flags: unittests
@@ -63,13 +88,13 @@ jobs:
           verbose: true
           token: ${{ secrets.CC_TOKEN }}
       - name: Archive webR build artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: webr-dist
           path: |
             dist
       - name: Archive webR documentation artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: webr-docs
           path: |
@@ -84,17 +109,32 @@ jobs:
       contents: read
     steps:
       - name: Download build archive
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: webr-dist
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v1
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE }}
           aws-region: ${{ secrets.AWS_REGION }}
       - name: Upload files to S3 bucket
         run: |
           aws s3 sync . s3://${{ secrets.AWS_S3_BUCKET }}/_webr/${{ github.ref_name }}/
+          gzip -k R.wasm
+          aws s3 cp --content-encoding="gzip" --content-type="application/wasm" \
+            --metadata-directive="REPLACE" R.wasm.gz \
+            s3://${{ secrets.AWS_S3_BUCKET }}/_webr/${{ github.ref_name }}/R.wasm
+          aws s3 cp --exclude "*" --include "*.js.metadata" --recursive \
+            --content-type="text/javascript" --metadata-directive="REPLACE" \
+            s3://${{ secrets.AWS_S3_BUCKET }}/_webr/${{ github.ref_name }}/ \
+            s3://${{ secrets.AWS_S3_BUCKET }}/_webr/${{ github.ref_name }}/
+          aws s3 cp --exclude "*" --include "*.data" --include "*.so" --recursive \
+            --content-type="application/wasm" --metadata-directive="REPLACE" \
+            s3://${{ secrets.AWS_S3_BUCKET }}/_webr/${{ github.ref_name }}/ \
+            s3://${{ secrets.AWS_S3_BUCKET }}/_webr/${{ github.ref_name }}/
+          aws cloudfront create-invalidation --distribution-id \
+            ${{ secrets.AWS_CLOUDFRONT_DISTRIBUTION_ID }} --paths "/latest/*" \
+            "/${{ github.ref_name }}/*"
   deploy_docs:
     name: Deploy webR documentation to S3
     needs: build
@@ -105,11 +145,11 @@ jobs:
       contents: read
     steps:
       - name: Download docs archive
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: webr-docs
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v1
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE }}
           aws-region: ${{ secrets.AWS_REGION }}
@@ -141,5 +181,19 @@ jobs:
         with:
           context: .
           push: true
+          build-args: |
+            WEBRCI_SHA=${{ github.sha }}
+            MAKE_LIBS_TARGET=all
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+  build-nix:
+    name: Build Nix flake
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: "sandbox = false"
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: Build Nix package
+        run: nix build --print-build-logs

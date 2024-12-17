@@ -5,7 +5,7 @@ import { syncResponse } from './task-main';
 import { ChannelMain, ChannelWorker } from './channel';
 import { ChannelType } from './channel-common';
 import { WebROptions } from '../webr-main';
-import { WebRChannelError } from '../error';
+import { WebRChannelError, WebRWorkerError } from '../error';
 
 import { IN_NODE } from '../compat';
 import type { Worker as NodeWorker } from 'worker_threads';
@@ -20,10 +20,13 @@ export class SharedBufferChannelMain extends ChannelMain {
 
   initialised: Promise<unknown>;
   resolve: (_?: unknown) => void;
-  close = () => {};
+  reject: (message: string | Error) => void;
+  close = () => { return; };
 
   constructor(config: Required<WebROptions>) {
     super();
+    ({ resolve: this.resolve, reject: this.reject, promise: this.initialised } = promiseHandles());
+
     const initWorker = (worker: Worker) => {
       this.#handleEventsFromWorker(worker);
       this.close = () => {
@@ -45,8 +48,6 @@ export class SharedBufferChannelMain extends ChannelMain {
       const worker = new Worker(`${config.baseUrl}webr-worker.js`);
       initWorker(worker);
     }
-
-    ({ resolve: this.resolve, promise: this.initialised } = promiseHandles());
   }
 
   interrupt() {
@@ -60,11 +61,23 @@ export class SharedBufferChannelMain extends ChannelMain {
   #handleEventsFromWorker(worker: Worker) {
     if (IN_NODE) {
       (worker as unknown as NodeWorker).on('message', (message: Message) => {
-        this.#onMessageFromWorker(worker, message);
+        void this.#onMessageFromWorker(worker, message);
+      });
+      (worker as unknown as NodeWorker).on('error', (ev: Event) => {
+        console.error(ev);
+        this.reject(new WebRWorkerError(
+          "An error occurred initialising the webR SharedBufferChannel worker."
+        ));
       });
     } else {
       worker.onmessage = (ev: MessageEvent) =>
         this.#onMessageFromWorker(worker, ev.data as Message);
+      worker.onerror = (ev) => {
+        console.error(ev);
+        this.reject(new WebRWorkerError(
+          "An error occurred initialising the webR SharedBufferChannel worker."
+        ));
+      };
     }
   }
 
@@ -124,8 +137,8 @@ export class SharedBufferChannelWorker implements ChannelWorker {
   #ep: Endpoint;
   #dispatch: (msg: Message) => void = () => 0;
   #interruptBuffer = new Int32Array(new SharedArrayBuffer(4));
-  #interrupt = () => {};
-  onMessageFromMainThread: (msg: Message) => void = () => {};
+  #interrupt = () => { return; };
+  onMessageFromMainThread: (msg: Message) => void = () => { return; };
 
   constructor() {
     this.#ep = (IN_NODE ? require('worker_threads').parentPort : globalThis) as Endpoint;
@@ -152,7 +165,7 @@ export class SharedBufferChannelWorker implements ChannelWorker {
   }
 
   inputOrDispatch(): number {
-    for (;;) {
+    for (; ;) {
       const msg = this.read();
       if (msg.type === 'stdin') {
         return Module.allocateUTF8(msg.data as string);
@@ -162,7 +175,19 @@ export class SharedBufferChannelWorker implements ChannelWorker {
   }
 
   run(args: string[]) {
-    Module.callMain(args);
+    try{
+      Module.callMain(args);
+    } catch (e) {
+      if (e instanceof WebAssembly.RuntimeError) {
+        this.writeSystem({ type: 'console.error', data: e.message });
+        this.writeSystem({
+          type: 'console.error',
+          data: "An unrecoverable WebAssembly error has occurred, the webR worker will be closed.",
+        });
+        this.writeSystem({ type: 'close' });
+      }
+      throw e;
+    }
   }
 
   setInterrupt(interrupt: () => void) {

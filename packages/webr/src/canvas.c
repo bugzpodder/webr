@@ -43,10 +43,15 @@
     }, 2*cGD->cx, 2*cGD->cy, 2*cGD->cw, 2*cGD->ch); \
 }
 
+unsigned int canvas_id = 0;
+
 typedef struct _canvasDesc {
     /* device specific stuff */
     int col;
     int fill;
+    unsigned int capture;
+    unsigned int canvas_id;
+    SEXP env;
 
     /* Line characteristics */
     double lwd;
@@ -163,6 +168,11 @@ void canvasSetLineType( canvasDesc *cGD, pGEcontext gc)
 void canvasActivate(const pDevDesc RGD)
 {
     canvasDesc *cGD = (canvasDesc *)RGD->deviceSpecific;
+    EM_ASM({
+        if (Module.webr.canvas[$0]) {
+            Module.canvasCtx = Module.webr.canvas[$0].ctx;
+        }
+    }, cGD->canvas_id);
 }
 
 void canvasCircle(double x, double y, double r,
@@ -206,6 +216,17 @@ void canvasSetClip(double x0, double x1, double y0, double y1, pDevDesc RGD)
 void canvasClose(pDevDesc RGD)
 {
     canvasDesc *cGD = (canvasDesc *)RGD->deviceSpecific;
+
+    // Set device as closed in info environment
+    SEXP closed = Rf_findVarInFrame(cGD->env, Rf_install("is_closed"));
+    LOGICAL(closed)[0] = TRUE;
+
+    // If not capturing, clean up the canvas cache
+    if (!cGD->capture) {
+        EM_ASM({ delete Module.webr.canvas[$0]; }, cGD->canvas_id);
+    }
+
+    R_ReleaseObject(cGD->env);
     free(cGD);
     RGD->deviceSpecific = NULL;
 }
@@ -247,7 +268,7 @@ void canvasMetricInfo(int c, const pGEcontext gc, double* ascent,
         const ffamily = (f) => fsans.includes(f) ? "sans-serif" : f;
         const font = `${fface[$2]} ${$0}px ${ffamily(UTF8ToString($1))}`;
         Module.canvasCtx.font = font;
-    }, 2*gc->ps, gc->fontfamily, gc->fontface);
+    }, 2 * gc->cex * gc->ps, gc->fontfamily, gc->fontface);
 
     *ascent = EM_ASM_DOUBLE({
         return Module.canvasCtx.measureText(
@@ -272,9 +293,16 @@ void canvasMode(int mode, pDevDesc RGD) {
     if (mode == 0) {
         canvasDesc *cGD = (canvasDesc *)RGD->deviceSpecific;
         EM_ASM({
-            const image = Module.offscreenCanvas.transferToImageBitmap();
-            chan.write({ type: 'canvas', data: { event: 'canvasImage', image } }, [image]);
-        });
+            const canvas = Module.webr.canvas[$0];
+            if (!canvas.capture) {
+                const image = canvas.offscreen.transferToImageBitmap();
+                Module.webr.channel.write({ type: 'canvas', data: {
+                    event: 'canvasImage',
+                    image,
+                    id: $0,
+                } }, [image]);
+            }
+        }, cGD->canvas_id);
     }
     return;
 }
@@ -282,6 +310,28 @@ void canvasMode(int mode, pDevDesc RGD) {
 void canvasNewPage(const pGEcontext gc, pDevDesc RGD)
 {
     canvasDesc *cGD = (canvasDesc *)RGD->deviceSpecific;
+
+    // If we are capturing, create a new Canvas element for each page
+    if (cGD->capture) {
+        cGD->canvas_id = canvas_id++;
+        SEXP canvas_symbol = Rf_install("canvas_ids");
+        SEXP canvas_ids = Rf_findVar(canvas_symbol, cGD->env);
+        int n = Rf_length(canvas_ids);
+        canvas_ids = Rf_lengthgets(canvas_ids, n + 1);
+        Rf_defineVar(canvas_symbol, canvas_ids, cGD->env);
+        INTEGER(canvas_ids)[n] = cGD->canvas_id;
+    }
+
+    EM_ASM({
+        if (!Module.webr.canvas[$0]) {
+            const offscreen = new OffscreenCanvas($2, $3);
+            Module.webr.canvas[$0] = {};
+            Module.webr.canvas[$0].offscreen = offscreen;
+            Module.webr.canvas[$0].ctx = offscreen.getContext('2d');
+            Module.webr.canvas[$0].capture = $1;
+        }
+        Module.canvasCtx = Module.webr.canvas[$0].ctx;
+    }, cGD->canvas_id, cGD->capture, 2*RGD->right, 2*RGD->bottom);
 
     EM_ASM({
         Module.canvasCtx.clearRect(0, 0, $0, $1);
@@ -296,8 +346,13 @@ void canvasNewPage(const pGEcontext gc, pDevDesc RGD)
     }
 
     EM_ASM({
-        chan.write({ type: 'canvas', data: { event: 'canvasNewPage' } });
-    });
+        if (!Module.webr.canvas[$0].capture) {
+            Module.webr.channel.write({ type: 'canvas', data: {
+                event: 'canvasNewPage',
+                id: $0,
+            } });
+        }
+    }, cGD->canvas_id);
 }
 
 void canvasPolygon(int n, double *x, double *y,
@@ -431,7 +486,7 @@ static double canvasStrWidth(const char *str, const pGEcontext gc, pDevDesc RGD)
         const font = `${fface[$2]} ${$0}px ${ffamily(UTF8ToString($1))}`;
         Module.canvasCtx.font = font;
         return Module.canvasCtx.measureText(UTF8ToString($3)).width;
-    }, 2*gc->ps, gc->fontfamily, gc->fontface, str) / 2.0;
+    }, 2 * gc->cex * gc->ps, gc->fontfamily, gc->fontface, str) / 2.0;
 }
 
 void canvasText(double x, double y, const char *str, double rot, double hadj,
@@ -475,9 +530,17 @@ void canvasRaster(unsigned int *raster, int w, int h,
                   double rot,
                   Rboolean interpolate,
                   const pGEcontext gc, pDevDesc dd) {
+    int scale_x = 1, scale_y = -1;
+
+    y += height;
     if (height < 0) {
-        y += height;
         height = -height;
+        scale_y = 1;
+    }
+
+    if (width < 0) {
+        width = -width;
+        scale_x = -1;
     }
 
     EM_ASM({Module.canvasCtx.save();});
@@ -499,8 +562,11 @@ void canvasRaster(unsigned int *raster, int w, int h,
         const img = new ImageData(new Uint8ClampedArray(raster), $1, $2);
         const buffer = new OffscreenCanvas($1, $2);
         buffer.getContext('2d').putImageData(img, 0, 0);
+        Module.canvasCtx.save();
+        Module.canvasCtx.scale($5, $6);
         Module.canvasCtx.drawImage(buffer, 0, 0, $3, $4);
-    }, raster, w, h, 2*width, 2*height);
+        Module.canvasCtx.restore();
+    }, raster, w, h, 2*width, 2*height, scale_x, scale_y);
 
     EM_ASM({Module.canvasCtx.restore();});
 }
@@ -524,7 +590,7 @@ void void_releaseMask(SEXP ref, pDevDesc RGD) {
     return;
 }
 
-SEXP ffi_dev_canvas(SEXP w, SEXP h, SEXP ps, SEXP bg)
+SEXP ffi_dev_canvas(SEXP w, SEXP h, SEXP ps, SEXP bg, SEXP capture, SEXP env)
 {
     /* R Graphics Device: in GraphicsDevice.h */
     pDevDesc RGD;
@@ -552,6 +618,14 @@ SEXP ffi_dev_canvas(SEXP w, SEXP h, SEXP ps, SEXP bg)
     }
     bgcolor = RGBpar(bg, 0);
 
+    if (!isLogical(capture)) {
+        error("`capture' must be a logical");
+    }
+
+    if (!isEnvironment(env)) {
+        error("`env' must be an environment");
+    }
+
     R_CheckDeviceAvailable();
 
     if (!(RGD = (pDevDesc)calloc(1, sizeof(NewDevDesc)))){
@@ -564,6 +638,20 @@ SEXP ffi_dev_canvas(SEXP w, SEXP h, SEXP ps, SEXP bg)
     }
 
     RGD->deviceSpecific = (void *) cGD;
+    cGD->capture = asInteger(capture);
+    cGD->canvas_id = canvas_id++;
+
+    // Setup the capture info environment
+    cGD->env = env;
+    R_PreserveObject(cGD->env);
+
+    SEXP canvas_ids = PROTECT(Rf_allocVector(INTSXP, 0));
+    SEXP closed = PROTECT(Rf_allocVector(LGLSXP, 1));
+    LOGICAL(closed)[0] = FALSE;
+
+    Rf_defineVar(Rf_install("canvas_ids"), canvas_ids, cGD->env);
+    Rf_defineVar(Rf_install("is_closed"), closed, cGD->env);
+    UNPROTECT(2);
 
     /* Callbacks */
     RGD->close = canvasClose;
@@ -624,8 +712,7 @@ SEXP ffi_dev_canvas(SEXP w, SEXP h, SEXP ps, SEXP bg)
     /* Add to the device list */
     RGE = GEcreateDevDesc(RGD);
     cGD->RGE = RGE;
-    GEaddDevice(RGE);
-    GEinitDisplayList(RGE);
+    GEaddDevice2(RGE, "canvas");
 
     int no_canvas =  EM_ASM_INT({
         return typeof OffscreenCanvas === "undefined";
@@ -633,20 +720,70 @@ SEXP ffi_dev_canvas(SEXP w, SEXP h, SEXP ps, SEXP bg)
 
     if (no_canvas) {
         Rf_error(
-            "This browser does not have support for OffscreenCanvas rendering. "
-            "Consider instead using a bitmap graphics device, such as png()."
+            "This environment does not have support for OffscreenCanvas. "
+            "Consider using a bitmap graphics device instead, such as png()."
         );
     }
 
-    EM_ASM({
-        Module.offscreenCanvas = new OffscreenCanvas($0, $1);
-        Module.canvasCtx = Module.offscreenCanvas.getContext('2d');
-    }, 2*width, 2*height);
-
     return R_NilValue;
 }
+
+SEXP ffi_dev_canvas_purge(void)
+{
+    EM_ASM({
+        Module.webr.canvas = {};
+        Module.canvasCtx = undefined;
+    });
+    return R_NilValue;
+}
+
+SEXP ffi_dev_canvas_destroy(SEXP ids)
+{
+    if (!isNumeric(ids)) error("`ids' must be an numerical vector");
+    SEXP int_ids = PROTECT(Rf_coerceVector(ids, INTSXP));
+
+    int n = Rf_length(int_ids);
+    int* px = INTEGER(int_ids);
+    for (int i = 0; i < n; ++i) {
+        EM_ASM({
+            delete Module.webr.canvas[$0];
+        }, px[i]);
+    }
+
+    UNPROTECT(1);
+    return R_NilValue;
+}
+
+SEXP ffi_dev_canvas_cache(void)
+{
+    int n = EM_ASM_INT({ return Object.keys(Module.webr.canvas).length; });
+    SEXP ids = PROTECT(Rf_allocVector(INTSXP, n));
+    for (int i = 0; i < n; ++i) {
+        INTEGER(ids)[i] = EM_ASM_INT({
+            return Object.keys(Module.webr.canvas)[$0];
+        }, i);
+    }
+    UNPROTECT(1);
+    return ids;
+}
+
 #else
 SEXP ffi_dev_canvas(SEXP args)
+{
+  error("This graphics device can only be used when running under webR.");
+}
+
+SEXP ffi_dev_canvas_purge(void)
+{
+  error("This graphics device can only be used when running under webR.");
+}
+
+SEXP ffi_dev_canvas_destroy(SEXP args)
+{
+  error("This graphics device can only be used when running under webR.");
+}
+
+SEXP ffi_dev_canvas_cache(void)
 {
   error("This graphics device can only be used when running under webR.");
 }

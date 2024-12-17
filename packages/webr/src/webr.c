@@ -22,7 +22,7 @@ SEXP ffi_eval_js(SEXP code) {
   const char *eval_template = "globalThis.Module.webr.evalJs(%p)";
   char eval_script[BUFSIZE];
   snprintf(eval_script, BUFSIZE, eval_template, R_CHAR(STRING_ELT(code, 0)));
-  return Rf_ScalarInteger(emscripten_run_script_int(eval_script));
+  return (SEXP) emscripten_run_script_int(eval_script);
 #else
     Rf_error("Function must be running under Emscripten.");
 #endif
@@ -60,7 +60,7 @@ void safe_eval_cleanup(void* cdata, Rboolean jump) {
   if (jump) {
     EM_ASM({
       throw new globalThis.Module.webr.UnwindProtectException(
-        'A non-local transfer of control occured during evaluation',
+        'A non-local transfer of control occurred during evaluation',
         $0
       );
     }, cdata);

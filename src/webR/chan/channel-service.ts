@@ -11,7 +11,7 @@ import { Endpoint } from './task-common';
 import { ChannelMain, ChannelWorker } from './channel';
 import { ChannelType } from './channel-common';
 import { WebROptions } from '../webr-main';
-import { WebRChannelError } from '../error';
+import { WebRChannelError, WebRWorkerError } from '../error';
 
 import { IN_NODE } from '../compat';
 import type { Worker as NodeWorker } from 'worker_threads';
@@ -25,7 +25,8 @@ export class ServiceWorkerChannelMain extends ChannelMain {
   initialised: Promise<unknown>;
 
   resolve: (_?: unknown) => void;
-  close = () => {};
+  reject: (message: string | Error) => void;
+  close = () => { return; };
 
   #syncMessageCache = new Map<string, Message>();
   #registration?: ServiceWorkerRegistration;
@@ -33,26 +34,34 @@ export class ServiceWorkerChannelMain extends ChannelMain {
 
   constructor(config: Required<WebROptions>) {
     super();
+    ({ resolve: this.resolve, reject: this.reject, promise: this.initialised } = promiseHandles());
+
+    console.warn(
+      "The ServiceWorker communication channel is deprecated and will be removed in a future version of webR. " +
+      "Consider using the PostMessage channel instead. If blocking input is required (for example, `browser()`) " +
+      "the SharedArrayBuffer channel should be used. See https://docs.r-wasm.org/webr/latest/serving.html for further information."
+    );
     const initWorker = (worker: Worker) => {
       this.#handleEventsFromWorker(worker);
       this.close = () => {
         worker.terminate();
         this.putClosedMessage();
       };
-      this.#registerServiceWorker(`${config.serviceWorkerUrl}webr-serviceworker.js`).then(
-        (clientId) => {
-          const msg = {
-            type: 'init',
-            data: {
-              config,
-              channelType: ChannelType.ServiceWorker,
-              clientId,
-              location: window.location.href,
-            },
-          } as Message;
-          worker.postMessage(msg);
-        }
-      );
+      void this.#registerServiceWorker(`${config.serviceWorkerUrl}webr-serviceworker.js`)
+        .then(
+          (clientId) => {
+            const msg = {
+              type: 'init',
+              data: {
+                config,
+                channelType: ChannelType.ServiceWorker,
+                clientId,
+                location: window.location.href,
+              },
+            } as Message;
+            worker.postMessage(msg);
+          }
+        );
     };
 
     if (isCrossOrigin(config.serviceWorkerUrl)) {
@@ -63,8 +72,6 @@ export class ServiceWorkerChannelMain extends ChannelMain {
       const worker = new Worker(`${config.serviceWorkerUrl}webr-worker.js`);
       initWorker(worker);
     }
-
-    ({ resolve: this.resolve, promise: this.initialised } = promiseHandles());
   }
 
   activeRegistration(): ServiceWorker {
@@ -83,7 +90,7 @@ export class ServiceWorkerChannelMain extends ChannelMain {
     this.#registration = await navigator.serviceWorker.register(url);
     await navigator.serviceWorker.ready;
     window.addEventListener('beforeunload', () => {
-      this.#registration?.unregister();
+      void this.#registration?.unregister();
     });
 
     // Ensure we can communicate with service worker and we have a client ID
@@ -102,7 +109,7 @@ export class ServiceWorkerChannelMain extends ChannelMain {
 
     // Setup listener for service worker messages
     navigator.serviceWorker.addEventListener('message', (event: MessageEvent<Request>) => {
-      this.#onMessageFromServiceWorker(event);
+      void this.#onMessageFromServiceWorker(event);
     });
     return clientId;
   }
@@ -148,13 +155,25 @@ export class ServiceWorkerChannelMain extends ChannelMain {
       (worker as unknown as NodeWorker).on('message', (message: Message) => {
         this.#onMessageFromWorker(worker, message);
       });
+      (worker as unknown as NodeWorker).on('error', (ev: Event) => {
+        console.error(ev);
+        this.reject(new WebRWorkerError(
+          "An error occurred initialising the webR ServiceWorkerChannel worker."
+        ));
+      });
     } else {
       worker.onmessage = (ev: MessageEvent) =>
         this.#onMessageFromWorker(worker, ev.data as Message);
+      worker.onerror = (ev) => {
+        console.error(ev);
+        this.reject(new WebRWorkerError(
+          "An error occurred initialising the webR ServiceWorkerChannel worker."
+        ));
+      };
     }
   }
 
-  #onMessageFromWorker = async (worker: Worker, message: Message) => {
+  #onMessageFromWorker = (worker: Worker, message: Message) => {
     if (!message || !message.type) {
       return;
     }
@@ -185,7 +204,7 @@ export class ServiceWorkerChannelMain extends ChannelMain {
       case 'request':
         throw new WebRChannelError(
           "Can't send messages of type 'request' from a worker." +
-            'Use service worker fetch request instead.'
+          'Use service worker fetch request instead.'
         );
     }
   };
@@ -201,8 +220,8 @@ export class ServiceWorkerChannelWorker implements ChannelWorker {
   #location: string;
   #lastInterruptReq = Date.now();
   #dispatch: (msg: Message) => void = () => 0;
-  #interrupt = () => {};
-  onMessageFromMainThread: (msg: Message) => void = () => {};
+  #interrupt = () => { return; };
+  onMessageFromMainThread: (msg: Message) => void = () => { return; };
 
   constructor(data: { clientId?: string; location?: string }) {
     if (!data.clientId || !data.location) {
@@ -239,7 +258,7 @@ export class ServiceWorkerChannelWorker implements ChannelWorker {
     this.write({ type: 'sync-request', data: request });
 
     let retryCount = 0;
-    for (;;) {
+    for (; ;) {
       try {
         const url = new URL('__wasm__/webr-fetch-request/', this.#location);
         const xhr = new XMLHttpRequest();
@@ -268,7 +287,7 @@ export class ServiceWorkerChannelWorker implements ChannelWorker {
   }
 
   inputOrDispatch(): number {
-    for (;;) {
+    for (; ;) {
       const msg = this.read();
       if (msg.type === 'stdin') {
         return Module.allocateUTF8(msg.data as string);
@@ -278,7 +297,19 @@ export class ServiceWorkerChannelWorker implements ChannelWorker {
   }
 
   run(args: string[]) {
-    Module.callMain(args);
+    try{
+      Module.callMain(args);
+    } catch (e) {
+      if (e instanceof WebAssembly.RuntimeError) {
+        this.writeSystem({ type: 'console.error', data: e.message });
+        this.writeSystem({
+          type: 'console.error',
+          data: "An unrecoverable WebAssembly error has occurred, the webR worker will be closed.",
+        });
+        this.writeSystem({ type: 'close' });
+      }
+      throw e;
+    }
   }
 
   setInterrupt(interrupt: () => void) {

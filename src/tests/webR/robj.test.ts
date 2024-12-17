@@ -31,7 +31,7 @@ beforeAll(async () => {
 
 // We don't destroy objects during unit tests but when webR starts
 // the count should be zero
-test('Initial shelter size', async () => {
+test('Initial shelter size', () => {
   expect(initShelterSize).toEqual(0);
 });
 
@@ -53,10 +53,44 @@ test('Get RObject type as a string', async () => {
   expect(await result.toString()).toEqual('[object RObject:null]');
 });
 
+describe('Working with R object classes', () => {
+  test('Get R object intrinsic class', async () => {
+    const numeric = await new webR.RDouble([1, 2, 3]);
+    const character = await new webR.RCharacter(['a', 'b', 'c']);
+
+    const numericClass = await numeric.class();
+    const characterClass = await character.class();
+    expect(await numericClass.toArray()).toContain("numeric");
+    expect(await characterClass.toArray()).toContain("character");
+  });
+
+  test('Get R object class vector', async () => {
+    const jsObj = { a: [1, 2, 3], b: [3, 4, 5], c: ['x', 'y', 'z'] };
+    const rObj = await new webR.RDataFrame(jsObj);
+    const classes = await rObj.class();
+    expect(await classes.toArray()).toEqual(["data.frame"]);
+  });
+
+  test('Get R object class vector from attributes', async () => {
+    const rObj = await webR.evalR('x <- 123; class(x) <- c("abc", "def"); x');
+    const classes = await rObj.class();
+    expect(await classes.toArray()).toEqual(["abc", "def"]);
+  });
+
+  test('Get S4 R object class vector', async () => {
+    const rClass = await webR.evalR('getClass("MethodDefinition")');
+    const classes = await rClass.class();
+    const attrs = await rClass.attrs();
+    const attrPackage = await attrs.get('package');
+    expect(await classes.toArray()).toEqual(["classRepresentation"]);
+    expect(await attrPackage.toString()).toEqual("methods");
+  });
+});
+
 describe('Working with R lists and vectors', () => {
   test('Get R object attributes', async () => {
     const vector = await webR.evalR('c(a=1, b=2, c=3)');
-    const value = (await vector.attrs()) as RList;
+    const value = (await vector.attrs()) as RPairlist;
     const attrs = await value.toObject({ depth: 0 });
     expect(attrs.names).toEqual(expect.objectContaining({ names: null, values: ['a', 'b', 'c'] }));
   });
@@ -116,7 +150,7 @@ describe('Working with R lists and vectors', () => {
   test('Throw an error when out of bounds using the pluck method', async () => {
     const vector = await webR.evalR('list(a=1, b=2, c=3)');
     const oob = vector.pluck(10);
-    await expect(oob).rejects.toThrow('non-local transfer of control occured');
+    await expect(oob).rejects.toThrow('non-local transfer of control occurred');
 
     const lastMsg = (await webR.flush()).pop();
     expect(lastMsg!.type).toEqual('stderr');
@@ -176,6 +210,24 @@ describe('Working with R lists and vectors', () => {
     expect(resJs.values[0]).toEqual(expect.objectContaining({ names: null, values: ['a'] }));
     expect(resJs.values[1]).toEqual(expect.objectContaining({ names: null, values: ['b'] }));
     expect(resJs.values[2]).toEqual(expect.objectContaining({ names: null, values: ['c'] }));
+  });
+
+  test('Convert an R data.frame to JS', async () => {
+    const result = await webR.evalR(`
+      data.frame(x = c(1,2,3), y = c(4,5,6), z = c(7,8,9))
+    `) as RList;
+    const obj = await result.toObject();
+    expect(obj).toEqual(expect.objectContaining({ x: [1, 2, 3], y: [4, 5, 6], z: [7, 8, 9] }));
+  });
+
+  test('Convert an R data.frame to D3 format', async () => {
+    const result = await webR.evalR(`
+      data.frame(x = c(1,2,3), y = c(4,5,6), z = c(7,8,9))
+    `) as RList;
+    const d3Obj = await result.toD3();
+    expect(d3Obj[0]).toEqual(expect.objectContaining({ x: 1, y: 4, z: 7 }));
+    expect(d3Obj[1]).toEqual(expect.objectContaining({ x: 2, y: 5, z: 8 }));
+    expect(d3Obj[2]).toEqual(expect.objectContaining({ x: 3, y: 6, z: 9 }));
   });
 
   test('Fully undefined names attribute', async () => {
@@ -397,9 +449,9 @@ describe('Working with R environments', () => {
 
   test('Set an item in an R environment', async () => {
     const env = (await webR.evalR('new.env()')) as REnvironment;
-    env.bind('a', 1);
-    env.bind('b', 2);
-    env.bind('.c', 3);
+    await env.bind('a', 1);
+    await env.bind('b', 2);
+    await env.bind('.c', 3);
     let value = (await env.getDollar('a')) as RDouble;
     expect(await value.toNumber()).toEqual(1);
     value = (await env.get('b')) as RDouble;
@@ -415,7 +467,7 @@ describe('Working with R environments', () => {
     expect(envJs.values[0]).toEqual(expect.objectContaining({ names: null, values: [null] }));
     expect(envJs.values[1]).toEqual(expect.objectContaining({ names: null, values: [true] }));
     expect(envJs.values[2]).toEqual(expect.objectContaining({ names: null, values: [false] }));
-    const envObj = await env.toObject();
+    const envObj = await env.toObject({ depth: 0 });
     expect(envObj['.c']).toEqual(expect.objectContaining({ names: null, values: [null] }));
     expect(envObj['a']).toEqual(expect.objectContaining({ names: null, values: [true] }));
     expect(envObj['b']).toEqual(expect.objectContaining({ names: null, values: [false] }));
@@ -448,6 +500,13 @@ describe('Invoking RFunction objects', () => {
     const four = await webR.evalR('4');
     const result = (await factorial.exec(four)) as RInteger;
     expect(await result.toNumber()).toBe(24);
+  });
+
+  test('Execute an R function with RFunction argument', async () => {
+    const factorial = (await webR.evalR('factorial')) as RFunction;
+    const five = await webR.evalR('5');
+    const result = await webR.evalRNumber('foo(bar)', { env: { foo: factorial, bar: five } });
+    expect(await result).toBe(120);
   });
 
   test('Pass JS booleans as R logical arguments', async () => {
@@ -544,7 +603,7 @@ describe('Garbage collection', () => {
     const mem = await webR.evalR('rnorm(10000,1,1)');
     const during = await ((await gc.exec(false, false, true)) as RDouble).toTypedArray();
 
-    webR.destroy(mem);
+    await webR.destroy(mem);
     const after = await ((await gc.exec(false, false, true)) as RDouble).toTypedArray();
 
     expect(during[0]).toBeGreaterThan(before[0]);
